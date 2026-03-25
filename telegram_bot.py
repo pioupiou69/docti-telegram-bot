@@ -483,12 +483,18 @@ async def start_handler(update, context):
         "Exemples :\n"
         "🎙️ _\"J'ai eu medfit au tel, intéressés\"_\n"
         "🎙️ _\"Démo faite avec Studio 11, veulent signer\"_\n\n"
-        "Commandes :\n"
-        "/status — Pipeline\n"
-        "/relances — À relancer\n"
-        "/hot — Leads HOT\n"
-        "/lead <nom> — Infos lead\n"
-        "/modifier <nom> <statut> — Changer le statut d'un lead",
+        "📊 **Pipeline & Leads**\n"
+        "/status — Pipeline complet\n"
+        "/hot — Leads HOT à contacter\n"
+        "/lead <nom> — Infos d'un lead\n"
+        "/search <terme> — Rechercher (ville, nom...)\n"
+        "/relances — Leads à relancer\n\n"
+        "✏️ **Actions**\n"
+        "/modifier <nom> <statut> — Changer le statut\n"
+        "/email <nom> — Préparer un email\n"
+        "/rappel <nom> <délai> — Créer un rappel\n\n"
+        "📋 **Résumé**\n"
+        "/resume — Résumé du jour (envoyé auto chaque matin)",
         parse_mode="Markdown",
     )
 
@@ -625,6 +631,374 @@ async def text_handler(update, context):
 
 
 # ---------------------------------------------------------------------------
+# Feature 1: Notifications (relances en retard, nouveaux leads)
+# ---------------------------------------------------------------------------
+
+async def check_notifications(context):
+    """Periodic job: send alerts for overdue relances and new leads."""
+    chat_id = context.job.data.get("chat_id")
+    if not chat_id:
+        return
+
+    sb = get_supabase()
+    now = datetime.now()
+    alerts = []
+
+    # Check overdue relances (leads at "1er Contact" with no interaction in 5+ days)
+    leads_1c = sb.table("leads").select("id, cabinet, city, email").eq("stage", "1er Contact").execute().data
+    for lead in leads_1c[:20]:
+        interactions = sb.table("interactions").select("created_at").eq("lead_id", lead["id"]).eq("direction", "sortant").order("created_at", desc=True).limit(1).execute().data
+        if interactions:
+            try:
+                last = datetime.fromisoformat(interactions[0]["created_at"].replace("Z", "").split("+")[0])
+                days = (now - last).days
+                if days >= 5:
+                    alerts.append(f"🔴 **{lead['cabinet']}** ({lead['city']}) — {days}j sans relance")
+            except (ValueError, TypeError):
+                pass
+
+    # Check new leads added in last 24h
+    yesterday = (now - timedelta(days=1)).isoformat()
+    new_leads = sb.table("leads").select("cabinet, city, score").gt("created_at", yesterday).order("score", desc=True).limit(10).execute().data
+
+    if new_leads:
+        alerts.append(f"\n🆕 **{len(new_leads)} nouveau(x) lead(s)** ajouté(s) :")
+        for nl in new_leads[:5]:
+            alerts.append(f"  • {nl['cabinet']} ({nl['city']}) — Score: {nl['score']:.0f}")
+
+    if alerts:
+        msg = "🔔 **Notifications Docti CRM**\n\n" + "\n".join(alerts)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            log.error("Notification error: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: Send email from Telegram
+# ---------------------------------------------------------------------------
+
+async def email_handler(update, context):
+    """Handle /email command to send a prospection email.
+    Usage: /email <cabinet_name>
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "📧 **Usage :** `/email <nom du cabinet>`\n\n"
+            "Envoie le template de prospection adapté au stage du lead.\n\n"
+            "**Exemple :**\n"
+            "`/email Studio 11`",
+            parse_mode="Markdown",
+        )
+        return
+
+    name = " ".join(context.args)
+    lead = find_lead_by_name(name)
+    if not lead:
+        await update.message.reply_text(f"❌ Cabinet '{name}' non trouvé dans le CRM.")
+        return
+
+    email = lead.get("email", "")
+    if not email or email == "nan" or "@" not in str(email):
+        await update.message.reply_text(f"❌ **{lead['cabinet']}** n'a pas d'adresse email.")
+        return
+
+    # Determine template based on stage
+    stage = lead.get("stage", "Lead")
+    stage_template = {
+        "Lead": ("Premier contact", "Simplifier la gestion de {cabinet} ?"),
+        "1er Contact": ("Relance", "Re: Simplifier la gestion de {cabinet} ?"),
+        "Reponse": ("Proposition démo", "Démo Docti pour {cabinet} — quel créneau ?"),
+    }
+    template_name, subject_tpl = stage_template.get(stage, ("Premier contact", "Simplifier la gestion de {cabinet} ?"))
+    subject = subject_tpl.replace("{cabinet}", lead["cabinet"])
+
+    await update.message.reply_text(
+        f"📧 **Email prêt pour {lead['cabinet']}**\n\n"
+        f"📬 À : {email}\n"
+        f"📝 Template : {template_name}\n"
+        f"📋 Sujet : {subject}\n"
+        f"📊 Stage actuel : {stage}\n\n"
+        f"→ Envoie `/email_confirm {lead['id']}` pour envoyer\n"
+        f"→ Ou ouvre le CRM pour personnaliser le message",
+        parse_mode="Markdown",
+    )
+
+
+async def email_confirm_handler(update, context):
+    """Confirm and log email sent via /email_confirm <lead_id>."""
+    if not context.args:
+        await update.message.reply_text("Usage: `/email_confirm <lead_id>`", parse_mode="Markdown")
+        return
+
+    try:
+        lead_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID invalide")
+        return
+
+    sb = get_supabase()
+    lead = sb.table("leads").select("*").eq("id", lead_id).single().execute().data
+
+    if not lead:
+        await update.message.reply_text("❌ Lead non trouvé")
+        return
+
+    # Log the interaction
+    log_interaction(lead_id, "Email", "Email envoyé", f"Envoyé via Telegram", "sortant")
+
+    # Update stage if needed
+    if lead["stage"] == "Lead":
+        sb.table("leads").update({"stage": "1er Contact", "updated_at": datetime.now().isoformat()}).eq("id", lead_id).execute()
+
+    await update.message.reply_text(
+        f"✅ Email enregistré pour **{lead['cabinet']}**\n"
+        f"📊 Stage: {lead['stage']} → {'1er Contact' if lead['stage'] == 'Lead' else lead['stage']}",
+        parse_mode="Markdown",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: Daily summary (automatic morning push)
+# ---------------------------------------------------------------------------
+
+async def daily_summary(context):
+    """Send daily morning summary."""
+    chat_id = context.job.data.get("chat_id")
+    if not chat_id:
+        return
+
+    sb = get_supabase()
+
+    # Pipeline stats
+    all_leads = []
+    offset = 0
+    while True:
+        batch = sb.table("leads").select("stage, qualification").range(offset, offset + 999).execute().data
+        all_leads.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+
+    from collections import Counter
+    stage_counts = Counter(l["stage"] for l in all_leads)
+    total = len(all_leads)
+
+    # Hot leads not contacted
+    hot_count = sb.table("leads").select("id", count="exact").eq("stage", "Lead").in_("qualification", ["Tres chaud", "Chaud"]).execute().count
+
+    # Relances needed
+    leads_1c = sb.table("leads").select("id, cabinet, city").eq("stage", "1er Contact").limit(50).execute().data
+    overdue = 0
+    now = datetime.now()
+    for lead in leads_1c:
+        interactions = sb.table("interactions").select("created_at").eq("lead_id", lead["id"]).eq("direction", "sortant").order("created_at", desc=True).limit(1).execute().data
+        if interactions:
+            try:
+                last = datetime.fromisoformat(interactions[0]["created_at"].replace("Z", "").split("+")[0])
+                if (now - last).days >= 5:
+                    overdue += 1
+            except (ValueError, TypeError):
+                pass
+
+    # Tasks due today
+    today_str = now.strftime("%Y-%m-%d")
+    tasks = sb.table("tasks").select("id", count="exact").eq("completed", 0).lte("due_date", today_str).execute().count
+
+    # Build message
+    msg = (
+        f"☀️ **Bonjour Théo ! Résumé du {now.strftime('%d/%m/%Y')}**\n\n"
+        f"📊 **Pipeline** — {total} leads\n"
+    )
+    stage_icons = {"Lead": "🔵", "1er Contact": "📤", "Reponse": "💬", "Demo proposee": "📅", "Demo faite": "🎬", "Negociation": "🤝", "Client signe": "🏆", "Perdu": "❌"}
+    for stage, cnt in stage_counts.most_common():
+        icon = stage_icons.get(stage, "•")
+        msg += f"  {icon} {stage}: {cnt}\n"
+
+    msg += f"\n⚡ **Priorités du jour**\n"
+    msg += f"  🔥 {hot_count} leads chauds à contacter\n"
+    msg += f"  🔴 {overdue} relances en retard\n"
+    msg += f"  📋 {tasks} tâche(s) du jour\n"
+
+    if hot_count > 0 or overdue > 0:
+        msg += f"\n💡 Tape /hot pour voir les leads ou /relances pour les relances"
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        log.error("Daily summary error: %s", e)
+
+
+async def resume_handler(update, context):
+    """Manual trigger for daily summary via /resume command."""
+    context.job = type('obj', (object,), {'data': {'chat_id': update.effective_chat.id}})()
+    await daily_summary(context)
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: Search leads from Telegram
+# ---------------------------------------------------------------------------
+
+async def search_handler(update, context):
+    """Handle /search command to find leads.
+    Usage: /search <query> — search by city, canton, or keyword
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "🔍 **Usage :** `/search <terme>`\n\n"
+            "**Exemples :**\n"
+            "`/search Genève` — leads à Genève\n"
+            "`/search pas contacté` — leads jamais contactés\n"
+            "`/search onedoc` — leads utilisant Onedoc",
+            parse_mode="Markdown",
+        )
+        return
+
+    query = " ".join(context.args).lower()
+    sb = get_supabase()
+
+    # Search by city
+    results = sb.table("leads").select("id, cabinet, city, email, stage, qualification, score").ilike("city", f"%{query}%").order("score", desc=True).limit(15).execute().data
+
+    # If no city match, try cabinet name
+    if not results:
+        results = sb.table("leads").select("id, cabinet, city, email, stage, qualification, score").ilike("cabinet", f"%{query}%").order("score", desc=True).limit(15).execute().data
+
+    # Special searches
+    if not results and "onedoc" in query:
+        results = sb.table("leads").select("id, cabinet, city, email, stage, qualification, score").eq("utilise_onedoc", 1).order("score", desc=True).limit(15).execute().data
+
+    if not results and ("pas contact" in query or "jamais contact" in query or "non contact" in query):
+        results = sb.table("leads").select("id, cabinet, city, email, stage, qualification, score").eq("stage", "Lead").neq("email", "").order("score", desc=True).limit(15).execute().data
+
+    # Search by canton
+    if not results:
+        results = sb.table("leads").select("id, cabinet, city, email, stage, qualification, score").ilike("canton", f"%{query}%").order("score", desc=True).limit(15).execute().data
+
+    if not results:
+        await update.message.reply_text(f"❌ Aucun résultat pour '{query}'")
+        return
+
+    lines = [f"🔍 **{len(results)} résultat(s) pour '{query}'** :\n"]
+    for lead in results:
+        icon = "🔥" if lead.get("qualification") == "Tres chaud" else "🟠" if lead.get("qualification") == "Chaud" else "⚪"
+        stage_icon = {"Lead": "🔵", "1er Contact": "📤", "Reponse": "💬", "Client signe": "🏆"}.get(lead.get("stage", ""), "•")
+        lines.append(
+            f"{icon} **{lead['cabinet']}** ({lead['city']})\n"
+            f"   {stage_icon} {lead['stage']} — Score: {lead['score']:.0f}\n"
+            f"   📧 {lead.get('email') or '—'}"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: Reminders from Telegram
+# ---------------------------------------------------------------------------
+
+async def rappel_handler(update, context):
+    """Handle /rappel command to create a reminder.
+    Usage: /rappel <cabinet> <délai> <note>
+    Examples:
+        /rappel Studio 11 demain
+        /rappel DynaMed 3j relancer par email
+        /rappel Physio Kinea 1h vérifier email
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "⏰ **Usage :** `/rappel <cabinet> <délai> [note]`\n\n"
+            "**Délais possibles :**\n"
+            "• `1h` — dans 1 heure\n"
+            "• `3h` — dans 3 heures\n"
+            "• `demain` — demain matin 9h\n"
+            "• `3j` — dans 3 jours\n"
+            "• `1sem` — dans 1 semaine\n\n"
+            "**Exemples :**\n"
+            "`/rappel Studio 11 demain`\n"
+            "`/rappel DynaMed 3j relancer par email`",
+            parse_mode="Markdown",
+        )
+        return
+
+    args_text = " ".join(context.args)
+
+    # Parse delay
+    delay = None
+    delay_text = ""
+    note = ""
+
+    delay_patterns = [
+        (r'(\d+)h\b', lambda m: timedelta(hours=int(m.group(1))), lambda m: f"{m.group(1)}h"),
+        (r'(\d+)j\b', lambda m: timedelta(days=int(m.group(1))), lambda m: f"{m.group(1)} jour(s)"),
+        (r'(\d+)sem\b', lambda m: timedelta(weeks=int(m.group(1))), lambda m: f"{m.group(1)} semaine(s)"),
+        (r'\bdemain\b', lambda m: timedelta(days=1), lambda m: "demain"),
+        (r'\bauj\b', lambda m: timedelta(hours=2), lambda m: "aujourd'hui"),
+    ]
+
+    for pattern, delta_fn, text_fn in delay_patterns:
+        match = re.search(pattern, args_text, re.IGNORECASE)
+        if match:
+            delay = delta_fn(match)
+            delay_text = text_fn(match)
+            # Cabinet name is before the delay, note is after
+            before = args_text[:match.start()].strip()
+            after = args_text[match.end():].strip()
+            note = after
+            cabinet_name = before
+            break
+
+    if not delay:
+        await update.message.reply_text("❌ Délai non reconnu. Utilise : `1h`, `3j`, `demain`, `1sem`", parse_mode="Markdown")
+        return
+
+    # Find lead
+    lead = find_lead_by_name(cabinet_name)
+    if not lead:
+        await update.message.reply_text(f"❌ Cabinet '{cabinet_name}' non trouvé.")
+        return
+
+    # Create task in Supabase
+    due_date = (datetime.now() + delay).strftime("%Y-%m-%d")
+    due_time = (datetime.now() + delay).strftime("%H:%M")
+    description = note or f"Rappel programmé via Telegram"
+
+    sb = get_supabase()
+    sb.table("tasks").insert({
+        "lead_id": lead["id"],
+        "task_type": "rappel",
+        "channel": "Telegram",
+        "description": description,
+        "due_date": due_date,
+    }).execute()
+
+    # Schedule Telegram reminder
+    chat_id = update.effective_chat.id
+    reminder_text = (
+        f"⏰ **Rappel : {lead['cabinet']}**\n"
+        f"📍 {lead['city']}\n"
+        f"📧 {lead.get('email') or '—'}\n"
+        f"📞 {lead.get('phone') or '—'}\n"
+        f"📝 {description}\n"
+        f"📊 Stage: {lead['stage']}"
+    )
+
+    context.application.job_queue.run_once(
+        lambda ctx: ctx.bot.send_message(chat_id=chat_id, text=reminder_text, parse_mode="Markdown"),
+        when=delay,
+        data={"chat_id": chat_id},
+        name=f"rappel_{lead['id']}_{due_date}",
+    )
+
+    await update.message.reply_text(
+        f"✅ **Rappel créé !**\n\n"
+        f"📋 {lead['cabinet']} ({lead['city']})\n"
+        f"⏰ Dans {delay_text} ({due_date} ~{due_time})\n"
+        f"📝 {description}",
+        parse_mode="Markdown",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -660,6 +1034,11 @@ def main():
     app.add_handler(CommandHandler("hot", hot_handler))
     app.add_handler(CommandHandler("lead", lead_handler))
     app.add_handler(CommandHandler("modifier", modifier_handler))
+    app.add_handler(CommandHandler("email", email_handler))
+    app.add_handler(CommandHandler("email_confirm", email_confirm_handler))
+    app.add_handler(CommandHandler("search", search_handler))
+    app.add_handler(CommandHandler("rappel", rappel_handler))
+    app.add_handler(CommandHandler("resume", resume_handler))
 
     # Voice handler
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_handler))
@@ -668,6 +1047,32 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     log.info("🤖 Docti CRM Bot démarré ! En attente de messages...")
+
+    # Get chat_id for scheduled jobs (from env or first /start)
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    if chat_id and app.job_queue:
+        # Daily summary at 8:00 AM
+        from datetime import time as dt_time
+        app.job_queue.run_daily(
+            daily_summary,
+            time=dt_time(hour=8, minute=0),
+            data={"chat_id": chat_id},
+            name="daily_summary",
+        )
+        # Notifications check every 4 hours
+        app.job_queue.run_repeating(
+            check_notifications,
+            interval=4 * 3600,
+            first=60,
+            data={"chat_id": chat_id},
+            name="notifications",
+        )
+        log.info("📅 Jobs programmés : résumé quotidien 8h + notifications toutes les 4h")
+    else:
+        log.warning("⚠️ TELEGRAM_CHAT_ID non configuré — pas de notifications automatiques")
+        log.info("   Envoie /start au bot, puis ajoute TELEGRAM_CHAT_ID dans les variables Koyeb")
+
     app.run_polling()
 
 
