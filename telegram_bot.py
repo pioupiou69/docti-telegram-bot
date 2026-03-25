@@ -542,6 +542,9 @@ async def voice_handler(update, context):
         response = await process_message(transcription)
         await update.message.reply_text(response, parse_mode="Markdown")
 
+    except Exception as e:
+        log.error("Erreur voice_handler: %s", e)
+        await update.message.reply_text(f"❌ Erreur : {str(e)[:200]}")
     finally:
         os.unlink(tmp_path)
 
@@ -607,8 +610,18 @@ async def text_handler(update, context):
     if not text:
         return
 
-    response = await process_message(text)
-    await update.message.reply_text(response, parse_mode="Markdown")
+    try:
+        response = await process_message(text)
+        await update.message.reply_text(response, parse_mode="Markdown")
+    except Exception as e:
+        log.error("Erreur text_handler: %s", e)
+        await update.message.reply_text(
+            f"❌ Erreur lors du traitement : {str(e)[:200]}\n\n"
+            f"💡 Essaie avec une commande :\n"
+            f"/status — Pipeline\n"
+            f"/lead <nom> — Infos lead\n"
+            f"/hot — Leads HOT",
+        )
 
 
 # ---------------------------------------------------------------------------
